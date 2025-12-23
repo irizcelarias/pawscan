@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { MessageCircle, Send, X, Loader2, Sparkles, PawPrint } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { supabase } from "@/integrations/supabase/client";
 
 interface Message {
   role: "user" | "assistant";
@@ -20,12 +19,18 @@ const ChatBot = () => {
   const [messages, setMessages] = useState<Message[]>([
     {
       role: "assistant",
-      content: "Hi there! I'm your pet care assistant. Ask me anything about pet nutrition, health, training, or care tips. I'm here to help! 🐾",
+      content:
+        "Hi there! I'm your pet care assistant. Ask me anything about pet nutrition, health, training, or care tips. I'm here to help! 🐾",
     },
   ]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const FLOWISE_URL = import.meta.env.VITE_FLOWISE_API_URL as string | undefined;
+
+  // ✅ follow-up prompts (ALWAYS array)
+  const [followUps, setFollowUps] = useState<string[]>([]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -33,36 +38,123 @@ const ChatBot = () => {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages, isOpen, followUps]);
+
+  // ✅ robust parser: supports array, JSON string, and double-encoded JSON string
+  const normalizeFollowUps = (val: any): string[] => {
+    if (!val) return [];
+
+    // already array
+    if (Array.isArray(val)) {
+      return val.filter((x) => typeof x === "string" && x.trim());
+    }
+
+    // string -> parse 1x or 2x
+    if (typeof val === "string") {
+      let s = val.trim();
+      if (!s) return [];
+
+      // sometimes Flowise returns like: "\"[\\\"q1\\\",\\\"q2\\\"]\""
+      // so parse repeatedly if needed
+      for (let i = 0; i < 2; i++) {
+        try {
+          const parsed = JSON.parse(s);
+
+          if (Array.isArray(parsed)) {
+            return parsed.filter((x) => typeof x === "string" && x.trim());
+          }
+
+          // if still string after parsing, try parse again
+          if (typeof parsed === "string") {
+            s = parsed.trim();
+            continue;
+          }
+
+          break;
+        } catch {
+          return [];
+        }
+      }
+      return [];
+    }
+
+    return [];
+  };
 
   const sendMessage = async (messageText?: string) => {
-    const textToSend = messageText || input.trim();
+    const textToSend = (messageText || input).trim();
     if (!textToSend || isLoading) return;
 
-    const userMessage: Message = { role: "user", content: textToSend };
-    setMessages((prev) => [...prev, userMessage]);
+    // ✅ clear followups when sending a new message
+    setFollowUps([]);
+
+    if (!FLOWISE_URL) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: textToSend },
+        {
+          role: "assistant",
+          content:
+            "Flowise is not configured. Please set VITE_FLOWISE_API_URL in your .env and restart the dev server.",
+        },
+      ]);
+      setInput("");
+      return;
+    }
+
+    setMessages((prev) => [...prev, { role: "user", content: textToSend }]);
     setInput("");
     setIsLoading(true);
 
     try {
-      const { data, error } = await supabase.functions.invoke("pet-ai", {
-        body: { type: "chat", message: textToSend },
+      const res = await fetch(FLOWISE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: textToSend }),
       });
 
-      if (error) throw error;
+      const rawText = await res.text();
 
-      const assistantMessage: Message = {
-        role: "assistant",
-        content: data.response,
-      };
-      setMessages((prev) => [...prev, assistantMessage]);
+      if (!res.ok) {
+        console.error("Flowise error:", res.status, rawText);
+        throw new Error(`Flowise error ${res.status}`);
+      }
+
+      let data: any = {};
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        data = { text: rawText };
+      }
+
+      const answer =
+        data.text ||
+        data.answer ||
+        data.response ||
+        data?.data?.text ||
+        "No response from Flowise.";
+
+      // ✅ parse follow-ups (Flowise key is followUpPrompts)
+      const ups = normalizeFollowUps(data.followUpPrompts);
+
+      // ✅ debug (tan-awa sa Console)
+      console.log("[Flowise] followUpPrompts raw:", data.followUpPrompts);
+      console.log("[Flowise] parsed followUps:", ups);
+
+      setMessages((prev) => [...prev, { role: "assistant", content: String(answer) }]);
+
+      // ✅ show follow-ups after assistant reply
+      if (ups.length > 0) setFollowUps(ups);
     } catch (error: any) {
       console.error("Chat error:", error);
-      const errorMessage: Message = {
-        role: "assistant",
-        content: "Sorry, I encountered an issue. Please try again in a moment.",
-      };
-      setMessages((prev) => [...prev, errorMessage]);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content:
+            "Sorry, I encountered an issue connecting to the chatbot. Please try again in a moment.",
+        },
+      ]);
     } finally {
       setIsLoading(false);
     }
@@ -103,9 +195,7 @@ const ChatBot = () => {
                 <h3 className="font-display font-bold text-primary-foreground">
                   Pet Care Assistant
                 </h3>
-                <p className="text-primary-foreground/80 text-xs">
-                  Ask me anything about pets!
-                </p>
+                <p className="text-primary-foreground/80 text-xs">Ask me anything about pets!</p>
               </div>
             </div>
           </div>
@@ -124,9 +214,7 @@ const ChatBot = () => {
                       : "bg-secondary text-secondary-foreground rounded-bl-sm"
                   }`}
                 >
-                  <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                    {msg.content}
-                  </p>
+                  <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
                 </div>
               </div>
             ))}
@@ -139,17 +227,38 @@ const ChatBot = () => {
               </div>
             )}
 
+            {/* ✅ Follow-up prompts (from Flowise) */}
+            {!isLoading && followUps.length > 0 && (
+              <div className="pt-1">
+                <div className="flex items-center gap-1 mb-2">
+                  <Sparkles className="w-3 h-3 text-primary" />
+                  <span className="text-xs font-medium text-muted-foreground">
+                    Try these prompts:
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {followUps.map((q, i) => (
+                    <button
+                      key={i}
+                      onClick={() => sendMessage(q)}
+                      className="text-xs bg-peach text-primary px-3 py-1.5 rounded-full hover:bg-primary hover:text-primary-foreground transition-colors"
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div ref={messagesEndRef} />
           </div>
 
-          {/* Suggestions */}
+          {/* Suggestions (initial only) */}
           {messages.length === 1 && (
             <div className="px-4 pb-2">
               <div className="flex items-center gap-1 mb-2">
                 <Sparkles className="w-3 h-3 text-primary" />
-                <span className="text-xs font-medium text-muted-foreground">
-                  Try asking:
-                </span>
+                <span className="text-xs font-medium text-muted-foreground">Try asking:</span>
               </div>
               <div className="flex flex-wrap gap-2">
                 {suggestedQuestions.map((q, i) => (
